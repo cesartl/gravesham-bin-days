@@ -1,0 +1,16 @@
+{
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.632.0",
+    "@aws-sdk/client-ssm": "^3.886.0",
+    "@aws-sdk/util-dynamodb": "^3.632.0",
+    "@sparticuz/chromium": "^127.0.0",
+    "axios": "^1.7.9",
+    "cheerio": "^1.0.0",
+    "googleapis": "^127.0.0",
+    "luxon": "^3.5.0",
+    "puppeteer-core": "^23.7.0"
+  },
+  "devDependencies": {
+    "puppeteer": "^23.7.0"
+  }
+}

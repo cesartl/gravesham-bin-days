@@ -1,0 +1,67 @@
+# "org" ensures this Service is used with the correct Serverless Framework Access Key.
+org: cesar101orw
+# "app" enables Serverless Framework Dashboard features and sharing them with other Services.
+app: gravesham-tools
+# "service" is the name of this project. This will also be added to your AWS resource names.
+service: gravesham-bin-days
+
+frameworkVersion: '4'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: eu-west-2
+  environment:
+    STATE_TABLE: ${self:service}-state
+    SOURCE_URL: https://my.gravesham.gov.uk/en/AchieveForms/?form_uri=sandbox-publish://AF-Process-22218d5c-c6d6-492f-b627-c713771126be/AF-Stage-905e87c1-144b-4a72-8932-5518ddd3e618/definition.json&redirectlink=%2Fen&cancelRedirectLink=%2Fen&consentMessage=yes
+    TZ: Europe/London
+    MESSAGE_SUFFIX: Your friendly neighbourhood bot.
+    # Gmail credentials are fetched from Parameter Store at runtime
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+          Resource:
+            - arn:aws:dynamodb:${aws:region}:*:table/${self:provider.environment.STATE_TABLE}
+        - Effect: Allow
+          Action:
+            - ssm:GetParameter
+            - ssm:GetParameters
+          Resource:
+            - arn:aws:ssm:${aws:region}:*:parameter/${self:service}/*
+
+package:
+  patterns:
+    - '!node_modules/.bin/**'
+    - '!**/*.map'
+    - 'config/**'
+
+functions:
+  daily:
+    handler: handler.daily
+    memorySize: 1536
+    timeout: 120
+    events:
+      - schedule:
+          name: ${self:service}-noon-london
+          description: Daily noon Europe/London bin checks
+          rate: cron(0 12 * * ? *)
+          method: scheduler
+          timezone: Europe/London
+
+resources:
+  Resources:
+    StateTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.STATE_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: addressHash
+            AttributeType: S
+        KeySchema:
+          - AttributeName: addressHash
+            KeyType: HASH
