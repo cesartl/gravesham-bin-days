@@ -200,11 +200,16 @@ exports.daily = async (event) => {
       const whenText = isTomorrow ? 'tomorrow' : `on ${ukFormattedDate}`;
       const announceDetails = result.collections.filter(c => c.localDate === announceDate).map(c => c.bins.join(', ')).join(' | ');
       const binsText = announceDetails || uniqueBins.join(' + ');
-      const msg = `Collection ${whenText} for ${label} (${ukFormattedDate}): ${binsText}\n\n${messageSuffix}`.trim();
+      const summaryLine = `Collection ${whenText} for ${label} (${ukFormattedDate}): ${binsText}`;
+      const msg = [summaryLine, messageSuffix].filter(Boolean).join('\n\n').trim();
+      const htmlBody = buildHtmlEmailBody(summaryLine, messageSuffix, result.tableHtml);
       const subject = `${binsText} collection on ${ukFormattedDate} - ${label}`;
 
       console.log(`Email subject: ${subject}`);
       console.log(`Email body: ${msg}`);
+      if (result.tableHtml) {
+        console.log(`Including HTML table (${result.tableHtml.length} chars) in email body`);
+      }
       
       const emailLike = (v) => /.+@.+\..+/.test(String(v || ''));
       const toList = recipients.filter(emailLike);
@@ -219,7 +224,7 @@ exports.daily = async (event) => {
           const email = toList[j];
           console.log(`Sending email ${j + 1}/${toList.length} to: ${email}`);
           try {
-            await sendEmail(email, subject, msg);
+            await sendEmail(email, subject, msg, htmlBody);
             console.log(`✓ Email sent successfully to ${email}`);
           } catch (error) {
             console.error(`✗ Failed to send email to ${email}:`, error.message);
@@ -230,7 +235,10 @@ exports.daily = async (event) => {
 
       if (!forceNotify && isTomorrow) {
         try {
-          await markNotified(addressHash, tomorrow, result.collections);
+          await markNotified(addressHash, tomorrow, {
+            collections: result.collections,
+            tableHtml: result.tableHtml
+          });
           console.log(`✓ Marked as notified for ${tomorrow}`);
         } catch (error) {
           console.error('Failed to mark as notified:', error);
@@ -300,8 +308,8 @@ async function scrapeNextCollections(browser, url, addressLabel) {
     }
     await saveFrameHtml(frame, 'after-results');
 
-    const collections = await extractCollections(frame);
-    return { collections };
+    const { collections, tableHtml } = await extractCollections(frame);
+    return { collections, tableHtml };
   } finally {
     await page.close();
   }
@@ -444,44 +452,10 @@ async function waitForResultsTable(frame, timeoutMs = 120000) {
 }
 
 async function extractCollections(frame) {
-  const table2Rows = await frame.evaluate(() => {
+  const tableData = await frame.evaluate(() => {
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const out = [];
-    const table2 = document.getElementById('table2') || document.querySelector('#table2');
-    if (table2) {
-      const trs = Array.from(table2.querySelectorAll('tr'));
-      for (const tr of trs) {
-        const cells = Array.from(tr.querySelectorAll('td, th'));
-        if (cells.length < 2) continue;
-        const c1 = norm(cells[0].textContent);
-        const c2 = norm(cells[1].textContent);
-        const isHeader = /collection\s*date/i.test(c1) && /bin\s*type/i.test(c2);
-        if (isHeader) continue;
-        if (c1 && c2) out.push({ dateText: c1, binsText: c2 });
-      }
-    }
-    return out;
-  });
-
-  const parsedTable2 = [];
-  for (const r of table2Rows) {
-    const dt = parseDateToLocal(r.dateText);
-    if (dt && r.binsText) parsedTable2.push({ localDate: dt.toISODate(), bins: [r.binsText] });
-  }
-  if (parsedTable2.length > 0) {
-    const byDate = new Map();
-    for (const r of parsedTable2) {
-      const existing = byDate.get(r.localDate) || [];
-      byDate.set(r.localDate, Array.from(new Set([...existing, ...r.bins])));
-    }
-    return Array.from(byDate.entries()).map(([localDate, bins]) => ({ localDate, bins }));
-  }
-
-  const rows = await frame.evaluate(() => {
-    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const out = [];
-    const tables = Array.from(document.querySelectorAll('table'));
-    for (const table of tables) {
+    const extractRows = (table) => {
+      const rows = [];
       const trs = Array.from(table.querySelectorAll('tr'));
       for (const tr of trs) {
         const cells = Array.from(tr.querySelectorAll('td, th'));
@@ -490,24 +464,43 @@ async function extractCollections(frame) {
         const col2 = norm(cells[1].textContent);
         const isHeader = /collection\s*date/i.test(col1) && /bin\s*type/i.test(col2);
         if (isHeader) continue;
-        if (col1 && col2) out.push({ dateText: col1, binsText: col2 });
+        if (col1 && col2) rows.push({ dateText: col1, binsText: col2 });
+      }
+      return rows;
+    };
+
+    const tableOrder = [];
+    const table2 = document.getElementById('table2') || document.querySelector('#table2');
+    if (table2) tableOrder.push(table2);
+    tableOrder.push(...Array.from(document.querySelectorAll('table')));
+
+    const seen = new Set();
+    for (const table of tableOrder) {
+      if (!table || seen.has(table)) continue;
+      seen.add(table);
+      const rows = extractRows(table);
+      if (rows.length > 0) {
+        return { rows, html: table.outerHTML };
       }
     }
-    return out;
+
+    return { rows: [], html: null };
   });
 
-  const parsed = [];
-  for (const r of rows) {
-    const dt = parseDateToLocal(r.dateText);
-    if (dt && r.binsText) parsed.push({ localDate: dt.toISODate(), bins: [r.binsText] });
-  }
-  if (parsed.length > 0) {
-    const byDate = new Map();
-    for (const r of parsed) {
-      const existing = byDate.get(r.localDate) || [];
-      byDate.set(r.localDate, Array.from(new Set([...existing, ...r.bins])));
+  const byDateFromTables = new Map();
+  for (const row of tableData.rows || []) {
+    const dt = parseDateToLocal(row.dateText);
+    if (!dt || !row.binsText) continue;
+    const localDate = dt.toISODate();
+    const existing = byDateFromTables.get(localDate) || [];
+    if (!existing.includes(row.binsText)) {
+      byDateFromTables.set(localDate, [...existing, row.binsText]);
     }
-    return Array.from(byDate.entries()).map(([localDate, bins]) => ({ localDate, bins }));
+  }
+
+  if (byDateFromTables.size > 0) {
+    const collections = Array.from(byDateFromTables.entries()).map(([localDate, bins]) => ({ localDate, bins }));
+    return { collections, tableHtml: tableData.html?.trim() || null };
   }
 
   const raw = await frame.evaluate(() => document.body.innerText || '');
@@ -527,7 +520,10 @@ async function extractCollections(frame) {
     const existing = byDate.get(r.localDate) || [];
     byDate.set(r.localDate, Array.from(new Set([...existing, ...r.bins])));
   }
-  return Array.from(byDate.entries()).map(([localDate, bins]) => ({ localDate, bins }));
+  return {
+    collections: Array.from(byDate.entries()).map(([localDate, bins]) => ({ localDate, bins })),
+    tableHtml: tableData.html?.trim() || null
+  };
 }
 
 function parseDateToLocal(str) {
@@ -575,7 +571,32 @@ async function markNotified(addressHash, localDate, snapshot) {
   await dynamo.send(cmd);
 }
 
-async function sendEmail(toEmail, subject, text) {
+function buildHtmlEmailBody(summaryLine, messageSuffix, tableHtml) {
+  const parts = [];
+  if (summaryLine) {
+    parts.push(`<p>${escapeHtml(summaryLine)}</p>`);
+  }
+  if (tableHtml) {
+    parts.push(tableHtml);
+  }
+  const suffix = (messageSuffix || '').trim();
+  if (suffix) {
+    const suffixHtml = escapeHtml(suffix).replace(/\n/g, '<br>');
+    parts.push(`<p>${suffixHtml}</p>`);
+  }
+  return parts.length > 0 ? parts.join('\n') : null;
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+async function sendEmail(toEmail, subject, text, html) {
   console.log(`📧 Attempting to send email to: ${toEmail}`);
   console.log(`📧 Subject: ${subject}`);
   
@@ -596,7 +617,7 @@ async function sendEmail(toEmail, subject, text) {
   
   const { clientId, clientSecret, refreshToken, sender } = credentials;
   if (!clientId || !clientSecret || !refreshToken || !sender) {
-    console.log('📧 Email (dry-run - missing credentials):', { toEmail, subject, text });
+    console.log('📧 Email (dry-run - missing credentials):', { toEmail, subject, text, hasHtml: !!html });
     console.log('📧 Missing credentials:', {
       clientId: !clientId,
       clientSecret: !clientSecret,
@@ -611,16 +632,48 @@ async function sendEmail(toEmail, subject, text) {
   
   console.log('📧 Initializing Gmail API...');
   const gmail = google.gmail({ version: 'v1', auth: oAuth2Client });
-  const messageParts = [
-    `From: ${sender}`,
-    `To: ${toEmail}`,
-    `Subject: ${subject}`,
-    'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset=utf-8',
-    '',
-    text,
-  ];
-  const message = messageParts.join('\n');
+
+  const plainText = text || '';
+  const htmlBody = html && html.trim().length > 0 ? html : null;
+  let message;
+  if (htmlBody) {
+    const boundary = `----=_Part_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const messageParts = [
+      `From: ${sender}`,
+      `To: ${toEmail}`,
+      `Subject: ${subject}`,
+      'MIME-Version: 1.0',
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
+      '',
+      `--${boundary}`,
+      'Content-Type: text/plain; charset=utf-8',
+      'Content-Transfer-Encoding: 7bit',
+      '',
+      plainText,
+      '',
+      `--${boundary}`,
+      'Content-Type: text/html; charset=utf-8',
+      'Content-Transfer-Encoding: 7bit',
+      '',
+      htmlBody,
+      '',
+      `--${boundary}--`,
+      ''
+    ];
+    message = messageParts.join('\n');
+  } else {
+    const messageParts = [
+      `From: ${sender}`,
+      `To: ${toEmail}`,
+      `Subject: ${subject}`,
+      'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset=utf-8',
+      '',
+      plainText,
+    ];
+    message = messageParts.join('\n');
+  }
+
   console.log('📧 Encoding message...');
   const encodedMessage = Buffer.from(message, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   
