@@ -6,6 +6,7 @@ const chromium = require('@sparticuz/chromium');
 const puppeteer = require('puppeteer-core');
 const { DynamoDBClient, UpdateItemCommand, GetItemCommand } = require('@aws-sdk/client-dynamodb');
 const { SSMClient, GetParametersCommand } = require('@aws-sdk/client-ssm');
+const axios = require('axios');
 const { google } = require('googleapis');
 
 const dynamo = new DynamoDBClient({});
@@ -115,6 +116,14 @@ exports.daily = async (event) => {
   }
   
   const sourceUrl = process.env.SOURCE_URL;
+  const dadJokePromise = fetchDadJokeWithTimeout(5000).then((joke) => {
+    if (joke) console.log('Dad joke fetched successfully');
+    else console.log('Dad joke fetch completed but no joke returned');
+    return joke;
+  }).catch((err) => {
+    console.warn('Dad joke fetch failed:', err.message);
+    return null;
+  });
   const now = DateTime.now().setZone(config.timezone || process.env.TZ || 'Europe/London');
   const tomorrow = now.plus({ days: 1 }).toISODate();
   const forceNotify = getForceNotify(event);
@@ -126,6 +135,8 @@ exports.daily = async (event) => {
   console.log('Launching browser...');
   const browser = await launchBrowser();
   console.log('✓ Browser launched successfully');
+  let dadJoke;
+  let dadJokeResolved = false;
   try {
     for (let i = 0; i < config.addresses.length; i++) {
       const address = config.addresses[i];
@@ -199,16 +210,26 @@ exports.daily = async (event) => {
       const ukFormattedDate = formatUKDate(announceDate);
       const whenText = isTomorrow ? 'tomorrow' : `on ${ukFormattedDate}`;
       const announceDetails = result.collections.filter(c => c.localDate === announceDate).map(c => c.bins.join(', ')).join(' | ');
+      if (!dadJokeResolved) {
+        dadJoke = await dadJokePromise;
+        dadJokeResolved = true;
+      }
+
       const binsText = announceDetails || uniqueBins.join(' + ');
       const summaryLine = `Collection ${whenText} for ${label} (${ukFormattedDate}): ${binsText}`;
-      const msg = [summaryLine, messageSuffix].filter(Boolean).join('\n\n').trim();
-      const htmlBody = buildHtmlEmailBody(summaryLine, messageSuffix, result.tableHtml);
+      const textParts = [summaryLine, messageSuffix];
+      if (dadJoke) textParts.push(`Dad joke of the day: ${dadJoke}`);
+      const msg = textParts.filter(Boolean).join('\n\n').trim();
+      const htmlBody = buildHtmlEmailBody(summaryLine, messageSuffix, result.tableHtml, dadJoke);
       const subject = `${binsText} collection on ${ukFormattedDate} - ${label}`;
 
       console.log(`Email subject: ${subject}`);
       console.log(`Email body: ${msg}`);
       if (result.tableHtml) {
         console.log(`Including HTML table (${result.tableHtml.length} chars) in email body`);
+      }
+      if (dadJoke) {
+        console.log(`Including dad joke in email: ${dadJoke}`);
       }
       
       const emailLike = (v) => /.+@.+\..+/.test(String(v || ''));
@@ -571,7 +592,7 @@ async function markNotified(addressHash, localDate, snapshot) {
   await dynamo.send(cmd);
 }
 
-function buildHtmlEmailBody(summaryLine, messageSuffix, tableHtml) {
+function buildHtmlEmailBody(summaryLine, messageSuffix, tableHtml, dadJoke) {
   const parts = [];
   if (!tableHtml && summaryLine) {
     parts.push(`<p>${escapeHtml(summaryLine)}</p>`);
@@ -583,6 +604,9 @@ function buildHtmlEmailBody(summaryLine, messageSuffix, tableHtml) {
   if (suffix) {
     const suffixHtml = escapeHtml(suffix).replace(/\n/g, '<br>');
     parts.push(`<p>${suffixHtml}</p>`);
+  }
+  if (dadJoke) {
+    parts.push(`<p><em>Dad joke of the day:</em> ${escapeHtml(dadJoke)}</p>`);
   }
   return parts.length > 0 ? parts.join('\n') : null;
 }
@@ -692,6 +716,33 @@ async function sendEmail(toEmail, subject, text, html) {
 
 function sha256(s) {
   return crypto.createHash('sha256').update(s).digest('hex');
+}
+
+async function fetchDadJokeWithTimeout(timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await axios.get('https://icanhazdadjoke.com/', {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'gravesham-bin-days/1.0'
+      },
+      signal: controller.signal,
+      timeout: timeoutMs
+    });
+    const joke = response.data?.joke;
+    if (typeof joke === 'string' && joke.trim()) {
+      return joke.trim();
+    }
+    return null;
+  } catch (error) {
+    if (error.name === 'CanceledError') {
+      throw new Error('Dad joke fetch timed out');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 module.exports = { daily: exports.daily };
