@@ -573,7 +573,7 @@ async function markNotified(addressHash, localDate, snapshot) {
 
 function buildHtmlEmailBody(summaryLine, messageSuffix, tableHtml) {
   const parts = [];
-  if (summaryLine) {
+  if (!tableHtml && summaryLine) {
     parts.push(`<p>${escapeHtml(summaryLine)}</p>`);
   }
   if (tableHtml) {
