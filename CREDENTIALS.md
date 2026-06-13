@@ -1,6 +1,6 @@
-# Secure Gmail Credentials Setup
+# Secure Email Credentials Setup
 
-This project uses AWS Systems Manager Parameter Store to securely store Gmail OAuth2 credentials instead of environment variables.
+This project uses AWS Systems Manager Parameter Store to securely store Gmail OAuth2 credentials and the optional Buttondown API key instead of environment variables.
 
 ## Why Parameter Store?
 
@@ -54,11 +54,14 @@ npx serverless deploy
 
 ## Parameter Names
 
-The following parameters are stored in Parameter Store:
+The following Gmail parameters are stored in Parameter Store:
 - `/{service-name}/gmail-client-id`
 - `/{service-name}/gmail-client-secret`
 - `/{service-name}/gmail-refresh-token`
 - `/{service-name}/gmail-sender`
+
+The optional Buttondown parameter is:
+- `/{service-name}/buttondown-api-key`
 
 ## Local Development
 
@@ -68,6 +71,7 @@ export GMAIL_CLIENT_ID="your-client-id"
 export GMAIL_CLIENT_SECRET="your-client-secret"
 export GMAIL_REFRESH_TOKEN="your-refresh-token"
 export GMAIL_SENDER="your-email@gmail.com"
+export BUTTONDOWN_API_KEY="your-buttondown-api-key"
 ```
 
 The code will automatically fall back to these if Parameter Store is unavailable.
@@ -113,5 +117,12 @@ aws ssm put-parameter \
   --name "/gravesham-bin-days/gmail-sender" \
   --value "your-email@gmail.com" \
   --type "SecureString" \
+  --region eu-west-2
+
+aws ssm put-parameter \
+  --name "/gravesham-bin-days/buttondown-api-key" \
+  --value "your-buttondown-api-key" \
+  --type "SecureString" \
+  --overwrite \
   --region eu-west-2
 ```

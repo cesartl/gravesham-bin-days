@@ -13,18 +13,19 @@ const dynamo = new DynamoDBClient({});
 const ssm = new SSMClient({});
 
 const CONFIG_PATH = path.join(__dirname, 'config', 'recipients.json');
+const SERVICE_NAME = 'gravesham-bin-days';
+const BUTTONDOWN_API_URL = process.env.BUTTONDOWN_API_URL || 'https://api.buttondown.email/v1/emails';
 
 // Helpers
 async function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function getGmailCredentials() {
   try {
-    const serviceName = 'gravesham-bin-days'; // Use consistent service name
     const paramNames = [
-      `/${serviceName}/gmail-client-id`,
-      `/${serviceName}/gmail-client-secret`, 
-      `/${serviceName}/gmail-refresh-token`,
-      `/${serviceName}/gmail-sender`
+      `/${SERVICE_NAME}/gmail-client-id`,
+      `/${SERVICE_NAME}/gmail-client-secret`,
+      `/${SERVICE_NAME}/gmail-refresh-token`,
+      `/${SERVICE_NAME}/gmail-sender`
     ];
     
     const command = new GetParametersCommand({
@@ -55,6 +56,23 @@ async function getGmailCredentials() {
       refreshToken: process.env.GMAIL_REFRESH_TOKEN,
       sender: process.env.GMAIL_SENDER
     };
+  }
+}
+
+async function getButtondownApiKey() {
+  try {
+    const paramName = `/${SERVICE_NAME}/buttondown-api-key`;
+    const command = new GetParametersCommand({
+      Names: [paramName],
+      WithDecryption: true
+    });
+
+    const response = await ssm.send(command);
+    const apiKey = response.Parameters?.find(param => param.Name === paramName)?.Value;
+    return apiKey || process.env.BUTTONDOWN_API_KEY;
+  } catch (error) {
+    console.log('Failed to fetch Buttondown API key from Parameter Store:', error.message);
+    return process.env.BUTTONDOWN_API_KEY;
   }
 }
 async function saveScreenshot(page, label) {
@@ -140,9 +158,9 @@ exports.daily = async (event) => {
   try {
     for (let i = 0; i < config.addresses.length; i++) {
       const address = config.addresses[i];
-      const { label, recipients } = address;
+      const { label, recipients = [] } = address;
       console.log(`\n--- Processing address ${i + 1}/${config.addresses.length}: ${label} ---`);
-      console.log(`Recipients: ${recipients.join(', ')}`);
+      console.log(`Recipients: ${recipients.map(describeRecipientForLog).join(', ')}`);
       
       let result;
       try {
@@ -222,6 +240,7 @@ exports.daily = async (event) => {
       const msg = textParts.filter(Boolean).join('\n\n').trim();
       const htmlBody = buildHtmlEmailBody(summaryLine, messageSuffix, result.tableHtml, dadJoke);
       const subject = `${binsText} collection on ${ukFormattedDate} - ${label}`;
+      const subjectWithoutLabel = `${binsText} collection on ${ukFormattedDate}`;
 
       console.log(`Email subject: ${subject}`);
       console.log(`Email body: ${msg}`);
@@ -232,23 +251,39 @@ exports.daily = async (event) => {
         console.log(`Including dad joke in email: ${dadJoke}`);
       }
       
-      const emailLike = (v) => /.+@.+\..+/.test(String(v || ''));
-      const toList = recipients.filter(emailLike);
-      console.log(`Valid email recipients: ${toList.join(', ')}`);
+      const deliveryTargets = normalizeRecipients(recipients);
+      const toList = deliveryTargets.directEmails;
+      console.log(`Valid direct email recipients: ${toList.map(({ email }) => email).join(', ') || '(none)'}`);
+      console.log(`Buttondown delivery enabled: ${deliveryTargets.buttondown}`);
       
-      if (toList.length === 0) {
-        console.log('⚠️ No valid email addresses found in recipients');
+      if (toList.length === 0 && !deliveryTargets.buttondown) {
+        console.log('⚠️ No valid delivery targets found in recipients');
       } else {
-        console.log(`Sending emails to ${toList.length} recipients...`);
-        
-        for (let j = 0; j < toList.length; j++) {
-          const email = toList[j];
-          console.log(`Sending email ${j + 1}/${toList.length} to: ${email}`);
+        if (toList.length > 0) {
+          console.log(`Sending direct emails to ${toList.length} recipients...`);
+
+          for (let j = 0; j < toList.length; j++) {
+            const { email, hideLabelInSubject } = toList[j];
+            const directSubject = hideLabelInSubject ? subjectWithoutLabel : subject;
+            console.log(`Sending direct email ${j + 1}/${toList.length} to: ${email}`);
+            try {
+              await sendEmail(email, directSubject, msg, htmlBody);
+              console.log(`✓ Direct email sent successfully to ${email}`);
+            } catch (error) {
+              console.error(`✗ Failed to send direct email to ${email}:`, error.message);
+              console.error('Error stack:', error.stack);
+            }
+          }
+        }
+
+        if (deliveryTargets.buttondown) {
+          console.log('Sending notification through Buttondown...');
           try {
-            await sendEmail(email, subject, msg, htmlBody);
-            console.log(`✓ Email sent successfully to ${email}`);
+            const buttondownSubject = deliveryTargets.buttondownHideLabelInSubject ? subjectWithoutLabel : subject;
+            await sendButtondownEmail(buttondownSubject, msg, htmlBody);
+            console.log('✓ Buttondown email sent successfully');
           } catch (error) {
-            console.error(`✗ Failed to send email to ${email}:`, error.message);
+            console.error('✗ Failed to send Buttondown email:', error.message);
             console.error('Error stack:', error.stack);
           }
         }
@@ -618,6 +653,99 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function normalizeRecipients(recipients = []) {
+  const directEmails = [];
+  const seenEmails = new Set();
+  let buttondown = false;
+  let buttondownHideLabelInSubject = false;
+  const emailLike = (v) => /.+@.+\..+/.test(String(v || ''));
+
+  for (const recipient of recipients || []) {
+    if (typeof recipient === 'string') {
+      if (emailLike(recipient) && !seenEmails.has(recipient)) {
+        directEmails.push({ email: recipient, hideLabelInSubject: false });
+        seenEmails.add(recipient);
+      } else if (recipient.trim().toLowerCase() === 'buttondown') {
+        buttondown = true;
+      }
+      continue;
+    }
+
+    if (!recipient || typeof recipient !== 'object') {
+      continue;
+    }
+
+    const type = String(recipient.type || recipient.channel || '').trim().toLowerCase();
+    if (type === 'buttondown' || recipient.buttondown === true) {
+      buttondown = true;
+      buttondownHideLabelInSubject = recipient.hideLabelInSubject === true || recipient.hideAddressInSubject === true || buttondownHideLabelInSubject;
+      continue;
+    }
+
+    const email = recipient.email || recipient.address;
+    if ((type === '' || type === 'email' || type === 'gmail' || type === 'direct') && emailLike(email) && !seenEmails.has(email)) {
+      directEmails.push({
+        email,
+        hideLabelInSubject: recipient.hideLabelInSubject === true || recipient.hideAddressInSubject === true
+      });
+      seenEmails.add(email);
+    }
+  }
+
+  return { directEmails, buttondown, buttondownHideLabelInSubject };
+}
+
+function describeRecipientForLog(recipient) {
+  if (typeof recipient === 'string') return recipient;
+  if (recipient && typeof recipient === 'object') {
+    if (recipient.email || recipient.address) return recipient.email || recipient.address;
+    if (recipient.type || recipient.channel) return recipient.type || recipient.channel;
+    if (recipient.buttondown === true) return 'buttondown';
+  }
+  return '(invalid recipient)';
+}
+
+async function sendButtondownEmail(subject, text, html) {
+  console.log('📧 Attempting to send email through Buttondown');
+  console.log(`📧 Subject: ${subject}`);
+
+  const apiKey = await getButtondownApiKey();
+  if (!apiKey) {
+    console.log('📧 Buttondown email (dry-run - missing BUTTONDOWN_API_KEY):', { subject, hasText: !!text, hasHtml: !!html });
+    return;
+  }
+
+  const body = html && html.trim().length > 0 ? html : text || '';
+  const payload = {
+    subject,
+    body,
+    status: process.env.BUTTONDOWN_EMAIL_STATUS || 'about_to_send'
+  };
+  const headers = {
+    Authorization: `Token ${apiKey}`,
+    'Content-Type': 'application/json'
+  };
+  if (payload.status === 'about_to_send') {
+    headers['X-Buttondown-Live-Dangerously'] = 'true';
+  }
+
+  try {
+    const response = await axios.post(BUTTONDOWN_API_URL, payload, {
+      headers,
+      timeout: 15000
+    });
+    console.log('📧 Buttondown API response:', {
+      status: response.status,
+      id: response.data?.id || response.data?.metadata?.id || '(not returned)'
+    });
+  } catch (error) {
+    if (error.response?.data) {
+      console.error('📧 Buttondown API response:', JSON.stringify(error.response.data, null, 2));
+    }
+    throw error;
+  }
 }
 
 async function sendEmail(toEmail, subject, text, html) {
