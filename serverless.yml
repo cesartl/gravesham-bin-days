@@ -48,7 +48,7 @@ functions:
       - schedule:
           name: ${self:service}-noon-london
           description: Daily noon Europe/London bin checks
-          rate: cron(0 12 * * ? *)
+          rate: cron(0 17 * * ? *)
           method: scheduler
           timezone: Europe/London
 
