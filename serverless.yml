@@ -43,7 +43,9 @@ functions:
   daily:
     handler: handler.daily
     memorySize: 1536
-    timeout: 120
+    timeout: 300
+    maximumRetryAttempts: 2
+    maximumEventAge: 3600
     events:
       - schedule:
           name: ${self:service}-noon-london

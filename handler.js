@@ -8,6 +8,7 @@ const { DynamoDBClient, UpdateItemCommand, GetItemCommand } = require('@aws-sdk/
 const { SSMClient, GetParametersCommand } = require('@aws-sdk/client-ssm');
 const axios = require('axios');
 const { google } = require('googleapis');
+const { retryScrape, withTimeout } = require('./scrape-retry');
 
 const dynamo = new DynamoDBClient({});
 const ssm = new SSMClient({});
@@ -112,7 +113,7 @@ async function clickByText(frame, texts) {
 }
 
 // Orchestration: exported Lambda handler
-exports.daily = async (event) => {
+exports.daily = async (event, context) => {
   console.log('=== Daily bin check starting ===');
   console.log('Event:', JSON.stringify(event, null, 2));
   console.log('Environment variables:', {
@@ -155,20 +156,42 @@ exports.daily = async (event) => {
   console.log('✓ Browser launched successfully');
   let dadJoke;
   let dadJokeResolved = false;
+  const scrapeFailures = [];
   try {
     for (let i = 0; i < config.addresses.length; i++) {
       const address = config.addresses[i];
       const { label, recipients = [] } = address;
       console.log(`\n--- Processing address ${i + 1}/${config.addresses.length}: ${label} ---`);
       console.log(`Recipients: ${recipients.map(describeRecipientForLog).join(', ')}`);
+
+      const addressHash = sha256(label);
+      if (!forceNotify) {
+        try {
+          if (await wasNotifiedForDate(addressHash, tomorrow)) {
+            console.log('Skipping - already notified for this date');
+            continue;
+          }
+        } catch (error) {
+          console.error('Failed to check notification status:', error);
+        }
+      }
       
       let result;
       try {
         console.log('Starting scrape...');
-        result = await scrapeNextCollections(browser, sourceUrl, label);
+        result = await retryScrape(
+          timeoutMs => scrapeNextCollections(browser, sourceUrl, label, timeoutMs),
+          {
+            label,
+            getRemainingTimeInMillis: context?.getRemainingTimeInMillis
+              ? () => context.getRemainingTimeInMillis()
+              : undefined
+          }
+        );
         console.log(`✓ Scraped ${result.collections.length} collections:`, result.collections);
       } catch (error) {
         console.error(`✗ Failed to scrape collections for ${label}:`, error);
+        scrapeFailures.push(new Error(`Failed to scrape ${label}`, { cause: error }));
         continue;
       }
       
@@ -178,23 +201,6 @@ exports.daily = async (event) => {
       if (!forceNotify && !hasTomorrow) {
         console.log('Skipping - no collection tomorrow and not in force mode');
         continue;
-      }
-
-      const addressHash = sha256(label);
-      console.log(`Address hash: ${addressHash}`);
-      
-      let alreadyNotified = false;
-      if (!forceNotify) {
-        try {
-          alreadyNotified = await wasNotifiedForDate(addressHash, tomorrow);
-          console.log(`Already notified check: ${alreadyNotified}`);
-        } catch (error) {
-          console.error('Failed to check notification status:', error);
-        }
-        if (alreadyNotified) {
-          console.log('Skipping - already notified for this date');
-          continue;
-        }
       }
 
       let announceDate = tomorrow;
@@ -307,6 +313,10 @@ exports.daily = async (event) => {
     console.log('✓ Browser closed');
   }
   
+  if (scrapeFailures.length) {
+    throw new AggregateError(scrapeFailures,
+      `Daily bin check failed: ${scrapeFailures.map(error => error.message).join('; ')}`);
+  }
   console.log('=== Daily bin check completed successfully ===');
   return { statusCode: 200, body: 'ok' };
 };
@@ -341,33 +351,35 @@ async function launchBrowser() {
   });
 }
 
-async function scrapeNextCollections(browser, url, addressLabel) {
+async function scrapeNextCollections(browser, url, addressLabel, timeoutMs = 60000) {
   const page = await browser.newPage();
   try {
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36');
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000 });
-    await saveScreenshot(page, 'after-goto');
-    await sleep(1500);
+    return await withTimeout(async () => {
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36');
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000 });
+      await saveScreenshot(page, 'after-goto');
+      await sleep(1500);
 
-    const frame = await getFormFrame(page);
-    await saveScreenshot(page, 'after-frame');
+      const frame = await getFormFrame(page);
+      await saveScreenshot(page, 'after-frame');
 
-    await ensureFormOpen(frame);
-    await saveFrameHtml(frame, 'after-open');
+      await ensureFormOpen(frame);
+      await saveFrameHtml(frame, 'after-open');
 
-    await typeAndSelectAddress(frame, page, addressLabel, getForceNotify());
+      await typeAndSelectAddress(frame, page, addressLabel, getForceNotify());
 
-    const tableOk = await waitForResultsTable(frame, 120000);
-    if (!tableOk) {
-      await saveFrameHtml(frame, 'no-results-timeout');
-      throw new Error('Results table did not render in time');
-    }
-    await saveFrameHtml(frame, 'after-results');
+      const tableOk = await waitForResultsTable(frame, 120000);
+      if (!tableOk) {
+        await saveFrameHtml(frame, 'no-results-timeout');
+        throw new Error('Results table did not render in time');
+      }
+      await saveFrameHtml(frame, 'after-results');
 
-    const { collections, tableHtml } = await extractCollections(frame);
-    return { collections, tableHtml };
+      const { collections, tableHtml } = await extractCollections(frame);
+      return { collections, tableHtml };
+    }, timeoutMs);
   } finally {
-    await page.close();
+    await page.close().catch(error => console.warn('Failed to close scrape page:', error.message));
   }
 }
 
@@ -380,6 +392,7 @@ async function getFormFrame(page) {
   }
   const start = Date.now();
   while (Date.now() - start < 60000) {
+    if (page.isClosed()) throw new Error('Scrape page closed while waiting for form');
     const frames = page.frames();
     for (const fr of frames) {
       try {
@@ -408,47 +421,53 @@ async function ensureFormOpen(frame) {
 
 async function typeAndSelectAddress(frame, page, label, forceNotify) {
   // 1) Find the address entry control (input/combobox/contenteditable or autoLookup field)
-  const handle = await frame.evaluateHandle(() => {
-    const isVisible = (el) => {
-      if (!el) return false;
-      const rect = el.getBoundingClientRect();
-      const style = window.getComputedStyle(el);
-      return !!(rect.width && rect.height) && style.visibility !== 'hidden' && style.display !== 'none';
-    };
-    // Prefer an input/combobox tied to the address lookup
-    let candidates = Array.from(document.querySelectorAll('input[aria-autocomplete="list"], input[role="combobox"], input[type="search"], input'))
-      .filter(isVisible);
-    if (candidates.length === 0) {
-      // Try contenteditable or the AchieveForms autoLookup container
-      const auto = document.querySelector('div[data-type="autoLookup"], [data-field-type="autoLookup"]');
-      if (auto) {
-        const inAuto = auto.querySelector('input, [contenteditable="true"], [role="combobox"]');
-        if (inAuto && isVisible(inAuto)) return inAuto;
+  let handle;
+  try {
+    handle = await frame.waitForFunction(() => {
+      const isVisible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return !!(rect.width && rect.height) && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      // Prefer an input/combobox tied to the address lookup
+      let candidates = Array.from(document.querySelectorAll('input[aria-autocomplete="list"], input[role="combobox"], input[type="search"], input'))
+        .filter(isVisible);
+      if (candidates.length === 0) {
+        // Try contenteditable or the AchieveForms autoLookup container
+        const auto = document.querySelector('div[data-type="autoLookup"], [data-field-type="autoLookup"]');
+        if (auto) {
+          const inAuto = auto.querySelector('input, [contenteditable="true"], [role="combobox"]');
+          if (inAuto && isVisible(inAuto)) return inAuto;
+        }
+        candidates = Array.from(document.querySelectorAll('[contenteditable="true"], [role="combobox"], input')).filter(isVisible);
       }
-      candidates = Array.from(document.querySelectorAll('[contenteditable="true"], [role="combobox"], input')).filter(isVisible);
-    }
-    const scoreOf = (el) => {
-      const attrs = [el.name, el.id, el.getAttribute?.('role'), el.getAttribute?.('aria-label'), el.placeholder, el.className]
-        .filter(Boolean).join(' ').toLowerCase();
-      let score = 0;
-      if (/address|lookup|find|search/.test(attrs)) score += 5;
-      if (/text|search/.test(el.type || '')) score += 2;
-      if (/date|time/.test(el.type || '')) score -= 3;
-      const field = el.closest?.('.field, .fieldContent, .af-block, fieldset, form');
-      if (field) {
-        const txt = (field.textContent || '').toLowerCase();
-        if (txt.includes('address')) score += 3;
-        if (txt.includes('postcode')) score += 1;
+      const scoreOf = (el) => {
+        const attrs = [el.name, el.id, el.getAttribute?.('role'), el.getAttribute?.('aria-label'), el.placeholder, el.className]
+          .filter(Boolean).join(' ').toLowerCase();
+        let score = 0;
+        if (/address|lookup|find|search/.test(attrs)) score += 5;
+        if (/text|search/.test(el.type || '')) score += 2;
+        if (/date|time/.test(el.type || '')) score -= 3;
+        const field = el.closest?.('.field, .fieldContent, .af-block, fieldset, form');
+        if (field) {
+          const txt = (field.textContent || '').toLowerCase();
+          if (txt.includes('address')) score += 3;
+          if (txt.includes('postcode')) score += 1;
+        }
+        return score;
+      };
+      let best = null; let bestScore = -Infinity;
+      for (const el of candidates) {
+        const sc = scoreOf(el);
+        if (sc > bestScore) { best = el; bestScore = sc; }
       }
-      return score;
-    };
-    let best = null; let bestScore = -Infinity;
-    for (const el of candidates) {
-      const sc = scoreOf(el);
-      if (sc > bestScore) { best = el; bestScore = sc; }
-    }
-    return best;
-  });
+      return best;
+    }, { polling: 250, timeout: 15000 });
+  } catch (error) {
+    await saveFrameHtml(frame, 'no-address-input');
+    throw new Error('Address input not found', { cause: error });
+  }
 
   const inputHandle = handle && handle.asElement ? handle.asElement() : null;
   if (!inputHandle) {

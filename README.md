@@ -66,3 +66,33 @@ For local development, you can set `BUTTONDOWN_API_KEY`. Buttondown uses `about_
 ```
 sls deploy
 ```
+
+## Retry behavior and manual runs
+
+Each address lookup waits up to 15 seconds for a visible address field, then
+retries failed scrapes in fresh browser tabs up to three total attempts, with
+2-second and 4-second delays. Each attempt has a 60-second budget. The Lambda
+timeout is 5 minutes; retries shorten their budget or stop early when necessary
+to leave 20 seconds for notification delivery and cleanup.
+
+Other addresses are still processed after an exhausted lookup. The handler then
+throws an error instead of reporting success, allowing Lambda to retry a failed
+scheduled invocation twice. Asynchronous events expire after one hour. Addresses
+already marked as notified for tomorrow are skipped before scraping on subsequent
+runs. Notification delivery itself is not retried by the scrape retry loop.
+
+Deploy both the handler and timeout/retry configuration with `sls deploy`.
+To manually invoke the deployed job and see its logs:
+
+```sh
+sls invoke --function daily --region eu-west-2 --data '{}' --log
+```
+
+Add `--stage <stage>` if needed. A manual synchronous invocation reports errors
+directly; Lambda's asynchronous retries apply to the scheduled invocation.
+The job checks tomorrow relative to the current time, so rerun a missed check
+before midnight. Avoid `forceNotify` for routine recovery: it bypasses notification
+deduplication and can send notifications for the next collection even when none is
+tomorrow.
+
+Run the offline regression tests with `npm test`.

@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.632.0",
     "@aws-sdk/client-ssm": "^3.886.0",
