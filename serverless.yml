@@ -13,10 +13,11 @@ provider:
   region: eu-west-2
   environment:
     STATE_TABLE: ${self:service}-state
+    RECIPIENTS_CONFIG_PARAMETER: /${self:service}/recipients-config
     SOURCE_URL: https://my.gravesham.gov.uk/en/AchieveForms/?form_uri=sandbox-publish://AF-Process-22218d5c-c6d6-492f-b627-c713771126be/AF-Stage-905e87c1-144b-4a72-8932-5518ddd3e618/definition.json&redirectlink=%2Fen&cancelRedirectLink=%2Fen&consentMessage=yes
     TZ: Europe/London
     MESSAGE_SUFFIX: Your friendly neighbourhood bot.
-    # Gmail credentials are fetched from Parameter Store at runtime
+    # Recipient config and messaging credentials are fetched from Parameter Store at runtime
   iam:
     role:
       statements:
@@ -37,7 +38,9 @@ package:
   patterns:
     - '!node_modules/.bin/**'
     - '!**/*.map'
-    - 'config/**'
+    - '!config/**'
+    - '!test/**'
+    - '!scripts/**'
 
 functions:
   daily:

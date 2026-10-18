@@ -9,11 +9,11 @@ const { SSMClient, GetParametersCommand } = require('@aws-sdk/client-ssm');
 const axios = require('axios');
 const { google } = require('googleapis');
 const { retryScrape, withTimeout } = require('./scrape-retry');
+const { loadRecipientsConfig, DEFAULT_CONFIG_PARAMETER } = require('./recipients-config');
 
 const dynamo = new DynamoDBClient({});
 const ssm = new SSMClient({});
 
-const CONFIG_PATH = path.join(__dirname, 'config', 'recipients.json');
 const SERVICE_NAME = 'gravesham-bin-days';
 const BUTTONDOWN_API_URL = process.env.BUTTONDOWN_API_URL || 'https://api.buttondown.email/v1/emails';
 
@@ -114,6 +114,11 @@ async function clickByText(frame, texts) {
 
 // Orchestration: exported Lambda handler
 exports.daily = async (event, context) => {
+  if (event?.dryRun !== undefined && typeof event.dryRun !== 'boolean') {
+    throw new Error('dryRun must be a boolean');
+  }
+  const dryRun = event?.dryRun === true;
+  const dryRunResults = [];
   console.log('=== Daily bin check starting ===');
   console.log('Event:', JSON.stringify(event, null, 2));
   console.log('Environment variables:', {
@@ -126,12 +131,16 @@ exports.daily = async (event, context) => {
   
   let config;
   try {
-    config = loadConfig(CONFIG_PATH);
+    config = await loadConfig();
     console.log(`✓ Loaded config for ${config.addresses.length} addresses`);
     console.log('Config timezone:', config.timezone);
   } catch (error) {
     console.error('✗ Failed to load config:', error);
     throw error;
+  }
+
+  if (event?.validateConfigOnly === true) {
+    return { statusCode: 200, body: 'Recipient configuration is valid' };
   }
   
   const sourceUrl = process.env.SOURCE_URL;
@@ -150,6 +159,7 @@ exports.daily = async (event, context) => {
   console.log(`Current time (${config.timezone || process.env.TZ || 'Europe/London'}): ${now.toISO()}`);
   console.log(`Tomorrow's date: ${tomorrow}`);
   console.log(`Force notify mode: ${forceNotify}`);
+  console.log(`Dry run mode: ${dryRun}`);
 
   console.log('Launching browser...');
   const browser = await launchBrowser();
@@ -169,6 +179,7 @@ exports.daily = async (event, context) => {
         try {
           if (await wasNotifiedForDate(addressHash, tomorrow)) {
             console.log('Skipping - already notified for this date');
+            if (dryRun) dryRunResults.push({ addressIndex: i, status: 'already_notified' });
             continue;
           }
         } catch (error) {
@@ -200,6 +211,7 @@ exports.daily = async (event, context) => {
 
       if (!forceNotify && !hasTomorrow) {
         console.log('Skipping - no collection tomorrow and not in force mode');
+        if (dryRun) dryRunResults.push({ addressIndex: i, status: 'no_collection_tomorrow', collections: result.collections });
         continue;
       }
 
@@ -261,6 +273,28 @@ exports.daily = async (event, context) => {
       const toList = deliveryTargets.directEmails;
       console.log(`Valid direct email recipients: ${toList.map(({ email }) => email).join(', ') || '(none)'}`);
       console.log(`Buttondown delivery enabled: ${deliveryTargets.buttondown}`);
+
+      if (dryRun) {
+        dryRunResults.push({
+          addressIndex: i,
+          status: toList.length || deliveryTargets.buttondown ? 'would_notify' : 'no_delivery_targets',
+          collections: result.collections,
+          notification: {
+            date: announceDate,
+            bins: uniqueBins,
+            text: msg,
+            html: htmlBody,
+            directEmails: toList.map(({ email, hideLabelInSubject }) => ({
+              to: email, subject: hideLabelInSubject ? subjectWithoutLabel : subject
+            })),
+            buttondown: deliveryTargets.buttondown ? {
+              subject: deliveryTargets.buttondownHideLabelInSubject ? subjectWithoutLabel : subject
+            } : null
+          }
+        });
+        console.log('Dry run: preview generated; delivery and notification-state updates skipped');
+        continue;
+      }
       
       if (toList.length === 0 && !deliveryTargets.buttondown) {
         console.log('⚠️ No valid delivery targets found in recipients');
@@ -318,6 +352,9 @@ exports.daily = async (event, context) => {
       `Daily bin check failed: ${scrapeFailures.map(error => error.message).join('; ')}`);
   }
   console.log('=== Daily bin check completed successfully ===');
+  if (dryRun) {
+    return { statusCode: 200, body: JSON.stringify({ dryRun: true, tomorrow, results: dryRunResults }) };
+  }
   return { statusCode: 200, body: 'ok' };
 };
 
@@ -327,13 +364,8 @@ function getForceNotify(event) {
   return false;
 }
 
-function loadConfig(p) {
-  const raw = fs.readFileSync(p, 'utf-8');
-  const cfg = JSON.parse(raw);
-  if (!cfg.addresses || !Array.isArray(cfg.addresses)) {
-    throw new Error('config.addresses must be an array');
-  }
-  return cfg;
+async function loadConfig() {
+  return loadRecipientsConfig(ssm, process.env.RECIPIENTS_CONFIG_PARAMETER || DEFAULT_CONFIG_PARAMETER);
 }
 
 async function launchBrowser() {

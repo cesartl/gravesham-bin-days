@@ -1,5 +1,6 @@
 {
   "scripts": {
+    "config:upload": "node scripts/upload-recipients-config.js",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {

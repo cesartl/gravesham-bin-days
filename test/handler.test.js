@@ -10,17 +10,22 @@ function loadHandler(overrides = {}) {
   class Client {}
   const now = {
     setZone() { return this; },
+    startOf: () => new Date('2026-10-14T00:00:00Z'),
     plus() { return { toISODate: () => '2026-10-15' }; },
     toISO: () => '2026-10-14T17:00:00+01:00'
   };
   const stubs = {
-    luxon: { DateTime: { now: () => now, fromISO: () => ({ isValid: true, day: 15, toFormat: () => 'October 2026' }) } },
+    luxon: { DateTime: { now: () => now, fromISO: value => ({
+      isValid: Number.isFinite(Date.parse(value)), day: new Date(value).getUTCDate(),
+      toFormat: () => 'October 2026', valueOf: () => Date.parse(value)
+    }) } },
     '@sparticuz/chromium': {},
     'puppeteer-core': {},
     '@aws-sdk/client-dynamodb': { DynamoDBClient: Client },
     '@aws-sdk/client-ssm': { SSMClient: Client },
     axios: {},
     googleapis: {},
+    './recipients-config': require('../recipients-config'),
     './scrape-retry': {
       withTimeout,
       retryScrape: (scrape, options) => retryScrape(scrape, { ...options, wait: async () => {}, logger: { log() {}, warn() {} } })
@@ -62,6 +67,117 @@ test('exhausted scrape failures fail the invocation, continue other addresses an
   });
   assert.deepEqual(calls, ['failing', 'failing', 'failing', 'healthy']);
   assert.equal(closed, true);
+});
+
+test('configuration-only checks await SSM config without scraping or sending notifications', async () => {
+  let loaded = false;
+  const { handler } = loadHandler({
+    loadConfig: async () => {
+      await Promise.resolve();
+      loaded = true;
+      return { timezone: 'Europe/London', addresses: [{ label: 'Example' }] };
+    },
+    launchBrowser: async () => { throw new Error('Browser must not start'); },
+    fetchDadJokeWithTimeout: async () => { throw new Error('External requests must not start'); }
+  });
+  const result = await handler.daily({ validateConfigOnly: true });
+  assert.equal(loaded, true);
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body, 'Recipient configuration is valid');
+});
+
+test('configuration failures stop the job before browser launch', async () => {
+  const { handler } = loadHandler({
+    loadConfig: async () => { throw new Error('SSM config unavailable'); },
+    launchBrowser: async () => { throw new Error('Browser must not start'); }
+  });
+  await assert.rejects(handler.daily({}), /SSM config unavailable/);
+});
+
+function loadDryRunHandler(overrides = {}) {
+  const effects = [];
+  let closed = false;
+  const { handler } = loadHandler({
+    loadConfig: async () => ({ addresses: [{ label: 'Example Road', recipients: [
+      { email: 'you@example.com', hideLabelInSubject: true },
+      { type: 'buttondown', hideLabelInSubject: true }
+    ] }] }),
+    fetchDadJokeWithTimeout: async () => null,
+    launchBrowser: async () => ({ close: async () => { closed = true; } }),
+    wasNotifiedForDate: async () => false,
+    scrapeNextCollections: async () => ({ collections: [{ localDate: '2026-10-15', bins: ['Recycling'] }], tableHtml: null }),
+    sendEmail: async () => effects.push('email'),
+    sendButtondownEmail: async () => effects.push('buttondown'),
+    markNotified: async () => effects.push('markNotified'),
+    ...overrides
+  });
+  return { handler, effects, closed: () => closed };
+}
+
+test('dry runs preview both delivery channels without sending or changing notification state', async () => {
+  const { handler, effects, closed } = loadDryRunHandler();
+  const response = await handler.daily({ dryRun: true });
+  const result = JSON.parse(response.body);
+  assert.equal(response.statusCode, 200);
+  assert.equal(result.dryRun, true);
+  assert.equal(result.results[0].status, 'would_notify');
+  const preview = result.results[0].notification;
+  assert.equal(preview.directEmails[0].to, 'you@example.com');
+  assert.match(preview.directEmails[0].subject, /Recycling collection on 15th October 2026/);
+  assert.equal(preview.directEmails[0].subject.includes('Example Road'), false);
+  assert.equal(preview.buttondown.subject, preview.directEmails[0].subject);
+  assert.match(preview.text, /Collection tomorrow/);
+  assert.match(preview.html, /Recycling/);
+  assert.deepEqual(effects, []);
+  assert.equal(closed(), true);
+});
+
+test('dry runs respect tomorrow-only selection and notification deduplication', async () => {
+  const noCollection = loadDryRunHandler({ scrapeNextCollections: async () => ({ collections: [] }) });
+  assert.equal(JSON.parse((await noCollection.handler.daily({ dryRun: true })).body).results[0].status, 'no_collection_tomorrow');
+  const alreadySent = loadDryRunHandler({
+    wasNotifiedForDate: async () => true,
+    scrapeNextCollections: async () => { throw new Error('Already notified addresses should not be scraped'); }
+  });
+  assert.equal(JSON.parse((await alreadySent.handler.daily({ dryRun: true })).body).results[0].status, 'already_notified');
+  assert.deepEqual(noCollection.effects, []);
+  assert.deepEqual(alreadySent.effects, []);
+});
+
+test('forceNotify can preview an upcoming collection and cannot override dry-run safety', async () => {
+  const { handler, effects } = loadDryRunHandler({
+    wasNotifiedForDate: async () => { throw new Error('Force mode must bypass deduplication'); },
+    scrapeNextCollections: async () => ({ collections: [{ localDate: '2026-10-20', bins: ['Food'] }] })
+  });
+  const result = JSON.parse((await handler.daily({ dryRun: true, forceNotify: true })).body);
+  assert.equal(result.results[0].notification.date, '2026-10-20');
+  assert.match(result.results[0].notification.text, /on 20th October 2026/);
+  assert.deepEqual(effects, []);
+});
+
+test('dry runs propagate exhausted scrape failures and close the browser without side effects', async () => {
+  const { handler, effects, closed } = loadDryRunHandler({
+    scrapeNextCollections: async () => { throw new Error('Website unavailable'); }
+  });
+  await assert.rejects(handler.daily({ dryRun: true }), /Failed to scrape/);
+  assert.deepEqual(effects, []);
+  assert.equal(closed(), true);
+});
+
+test('invalid dryRun values fail before any live processing', async () => {
+  const { handler, effects } = loadDryRunHandler({
+    loadConfig: async () => { throw new Error('Configuration should not be loaded'); }
+  });
+  for (const dryRun of ['true', 'false', 1, null]) {
+    await assert.rejects(handler.daily({ dryRun }), /dryRun must be a boolean/);
+  }
+  assert.deepEqual(effects, []);
+});
+
+test('dryRun false preserves normal Gmail, Buttondown and notification-state updates', async () => {
+  const { handler, effects } = loadDryRunHandler();
+  assert.equal((await handler.daily({ dryRun: false })).body, 'ok');
+  assert.deepEqual(effects, ['email', 'buttondown', 'markNotified']);
 });
 
 test('a retry of a partial run skips successful notifications before scraping', async () => {

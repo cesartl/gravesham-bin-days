@@ -17,7 +17,28 @@ Daily Lambda that checks Gravesham "Check your bin day" and sends email notifica
 
 ## Config
 
-Edit `config/recipients.json` and redeploy.
+The Lambda reads recipient JSON from the SSM Parameter Store `SecureString`
+`/gravesham-bin-days/recipients-config` in `eu-west-2` at the start of every
+invocation. Updates take effect on the next run without redeploying. The
+`RECIPIENTS_CONFIG_PARAMETER` environment variable can override the parameter name.
+
+To validate and upload a private local JSON file, then verify the stored value:
+
+```sh
+npm run config:upload -- /absolute/path/to/recipients.json
+```
+
+This requires AWS credentials with SSM write/read and KMS encrypt/decrypt access.
+The command uses the standard parameter tier (up to 4 KB) and does not print
+recipient data. Set `AWS_REGION` to override the default `eu-west-2` region.
+Keep actual recipient files outside Git; `config/**` is excluded from deployment.
+
+To check that the deployed Lambda can fetch, decrypt and validate its config
+without scraping or sending notifications:
+
+```sh
+sls invoke --function daily --stage dev --region eu-west-2 --data '{"validateConfigOnly":true}'
+```
 
 Plain string recipients are sent directly with the Gmail API. Add `{ "type": "buttondown" }` to publish the notification through Buttondown instead. You can include both for the same address while testing.
 
@@ -94,5 +115,31 @@ The job checks tomorrow relative to the current time, so rerun a missed check
 before midnight. Avoid `forceNotify` for routine recovery: it bypasses notification
 deduplication and can send notifications for the next collection even when none is
 tomorrow.
+
+## Dry runs
+
+Preview the daily job using the real SSM configuration, live website and
+notification-history checks, without sending Gmail or Buttondown messages or
+writing notification history:
+
+```sh
+sls invoke --function daily --stage dev --region eu-west-2 --data '{"dryRun":true}'
+```
+
+The response body contains JSON with per-address results: `already_notified`,
+`no_collection_tomorrow`, `no_delivery_targets`, or `would_notify`. Notification
+previews include text, HTML and the subject used for each delivery target.
+Treat the response and logs as private: they contain addresses and recipients.
+
+To preview the next collection even when tomorrow has none, or bypass an
+already-notified check, combine the two options:
+
+```sh
+sls invoke --function daily --stage dev --region eu-west-2 --data '{"dryRun":true,"forceNotify":true}'
+```
+
+`dryRun` must be a JSON boolean. Even with `forceNotify`, dry runs send nothing
+and never mark addresses as notified. Scrape failures still fail the invocation
+after retries. Dry runs do not test delivery credentials or email delivery.
 
 Run the offline regression tests with `npm test`.
